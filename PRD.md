@@ -1,229 +1,222 @@
-# PRD — Pasar Malam: TikTok Live Gift → Realtime Game
+# PRD — Pasar Malam: TikTok Live Gift → Mesin Capit (Arsitektur Lokal)
 
 | Item | Nilai |
 |---|---|
-| Produk | **Pasar Malam** — kumpulan mini-game interaktif yang dikendalikan gift penonton TikTok Live |
+| Produk | **Pasar Malam** — kumpulan mini-game yang dikendalikan gift penonton TikTok Live |
 | Game pertama | **Capit 2D** (claw machine) |
-| Versi dokumen | 1.0 (draft) |
+| Versi dokumen | 1.1 — fokus arsitektur & infrastruktur **lokal** |
 | Tanggal | 2026-10-18 |
-| Status | Disetujui untuk MVP |
-| Prinsip infrastruktur | **100% free tier** — tanpa biaya bulanan |
+| Lingkungan | Berjalan 100% di **PC streamer** (Windows/macOS/Linux), tanpa server cloud |
+| Biaya | **Rp 0** — seluruh teknologi open source / gratis |
 
 ---
 
 ## 1. Ringkasan
 
-Pasar Malam adalah overlay game yang tampil di siaran TikTok Live (via OBS / TikTok LIVE Studio). Setiap gift dari penonton dikonversi menjadi **koin game**: **1 koin TikTok = 1 percobaan**. Game merespons secara realtime (< 2 detik dari gift ke animasi), menampilkan nama/avatar gifter, dan menyimpan riwayat serta leaderboard.
+Satu aplikasi lokal bernama **Pasar Malam Server** berjalan di PC streamer, di samping OBS / TikTok LIVE Studio. Aplikasi ini:
 
-Game pertama adalah **Capit 2D**: capit turun, mencengkeram hadiah, lalu membawanya ke lubang hadiah. Logika payout mengikuti standar arcade (weak grip / strong grip) dengan peluang menang efektif **1:100**.
+1. **Menangkap gift TikTok Live secara otomatis** dari room streamer (tanpa input manual).
+2. Mengonversi gift menjadi koin: **1 koin TikTok = 1 percobaan**.
+3. Mengantrekan percobaan, **memutuskan hasil (menang/kalah)** dengan logika arcade (peluang 1:100), dan
+4. **Menjalankan mesin capit 2D** di halaman overlay yang ditampilkan OBS sebagai Browser Source, secara realtime (< 1 detik dari gift ke reaksi di layar).
 
-### 1.1 Tujuan
-1. Meningkatkan jumlah gift & durasi tonton dengan interaksi langsung yang terlihat di layar.
-2. Arsitektur **modular**: game baru di Pasar Malam cukup menambah modul tanpa mengubah pipeline gift.
-3. Biaya operasional **Rp 0** dengan memanfaatkan free tier (Cloudflare, GitHub).
-4. Hasil permainan **adil, dapat diaudit, dan dapat dikonfigurasi**.
+Internet hanya dipakai untuk dua hal: siaran live itu sendiri dan koneksi pembaca event TikTok. Semua logika game, antrean, database, dan tampilan berjalan di `localhost`.
 
-### 1.2 Non-goals (di luar cakupan)
-- **Tidak ada hadiah uang/barang bernilai tunai atau cash-out.** Hadiah bersifat virtual (shout-out, badge, posisi leaderboard, request lagu, dll.) agar tidak dikategorikan sebagai perjudian dan tetap patuh pada kebijakan komunitas TikTok.
-- Tidak membangun aplikasi mobile; client game berbasis web.
-- Tidak menggunakan API resmi TikTok berbayar/terbatas (belum tersedia publik untuk event gift).
+### Non-goals
+- Tidak ada hadiah uang / cash-out — hadiah bersifat **virtual** (shout-out, badge, leaderboard) agar tidak dikategorikan perjudian oleh kebijakan TikTok.
+- Tidak ada server cloud pada MVP (sinkronisasi online = opsional, lihat Roadmap).
 
 ---
 
-## 2. Persona & User Stories
-
-| Persona | Kebutuhan |
-|---|---|
-| **Streamer** (pemilik akun) | Menyalakan game dengan cepat, overlay stabil, bisa pause/atur win-rate. |
-| **Penonton / Gifter** | Mengirim gift → langsung melihat giliran & hasil dengan namanya di layar. |
-| **Admin / Moderator** | Memantau koneksi, antrean, audit hasil, simulasi gift untuk testing. |
-
-User stories utama:
-- **US-01** Sebagai gifter, saat saya mengirim Rose (1 koin), saya mendapat 1 percobaan dan nama saya muncul di antrean.
-- **US-02** Sebagai gifter, saat saya mengirim gift 5 koin dengan combo ×3, saya mendapat 15 percobaan (dibatasi cap per user).
-- **US-03** Sebagai penonton, saya melihat capit bergerak, mencengkeram, dan hasil MENANG/KALAH dengan jelas.
-- **US-04** Sebagai streamer, saya bisa pause game, mengubah win-rate, dan reset antrean dari dashboard.
-- **US-05** Sebagai admin, saya bisa mengirim "gift palsu" (simulator) untuk tes tanpa live.
-- **US-06** Sebagai streamer, jika koneksi internet putus sesaat, game otomatis tersambung kembali tanpa kehilangan antrean.
-
----
-
-## 3. Arsitektur Sistem
-
-### 3.1 Diagram
+## 2. Gambaran Arsitektur Lokal
 
 ```
-┌────────────────┐   Webcast WS (unofficial)   ┌──────────────────────────────────┐
-│  TikTok LIVE   │ ──────────────────────────► │  BRIDGE (Node.js) @ PC streamer  │
-│ (room streamer)│                             │  - tiktok-live-connector         │
-└────────────────┘                             │  - normalisasi & dedupe event    │
-                                               │  - buffer offline (SQLite lokal) │
-                                               └───────────────┬──────────────────┘
-                                                               │ WSS + token HMAC
-                                                               ▼
-                         ┌──────────────────────────────────────────────────────────┐
-                         │  CLOUDFLARE WORKER  (router, auth, REST admin)           │
-                         │      └─► DURABLE OBJECT "Room:{streamerId}"              │
-                         │           - otoritatif: antrean, RNG, pity, state game   │
-                         │           - SQLite storage (state room, idempotency)     │
-                         │           - WebSocket Hibernation API (broadcast)        │
-                         │      └─► D1 (riwayat play, audit RNG, leaderboard)       │
-                         └───────────────┬───────────────────────────┬──────────────┘
-                                         │ WSS broadcast             │ HTTPS + WSS
-                                         ▼                           ▼
-                    ┌────────────────────────────────┐   ┌───────────────────────────┐
-                    │ GAME CLIENT (Phaser 3) @ Pages │   │ ADMIN DASHBOARD @ Pages   │
-                    │  → OBS Browser Source 1080x1920│   │  dilindungi CF Access     │
-                    └────────────────────────────────┘   └───────────────────────────┘
+                ┌──────────────────────────────┐
+                │  TikTok LIVE (room streamer) │
+                └──────────────┬───────────────┘
+                               │ (1) WebSocket "webcast" (protobuf)
+                               │     signature URL dari sign server Euler Stream
+                               ▼
+┌──────────────────── PC STREAMER : Pasar Malam Server (Node.js 20, 1 proses) ────────────────────┐
+│                                                                                                 │
+│  [1] GIFT LISTENER ──► [2] EVENT BUS ──► [3] QUEUE MANAGER ──► [4] GAME ENGINE (Claw)           │
+│   tiktok-live-          EventEmitter       antrean FIFO,         state machine sesi,            │
+│   connector             internal           cap/user, saldo       Payout RNG + pity              │
+│   normalisasi,                                   │                     │                        │
+│   dedupe, combo                                  ▼                     ▼                        │
+│                                         [5] STORAGE  SQLite (better-sqlite3, mode WAL)          │
+│                                             plays · audit · saldo · config · msgId              │
+│                                                                                                 │
+│  [6] HTTP + WEBSOCKET SERVER  (Fastify)   http://127.0.0.1:3000                                 │
+│        /overlay  → halaman game Phaser 3     /admin → dashboard     /ws → event realtime        │
+└───────────────────────────────┬───────────────────────────────────────────┬─────────────────────┘
+                                │ ws://127.0.0.1:3000/ws                    │
+                                ▼                                           ▼
+             ┌─────────────────────────────────────┐      ┌──────────────────────────────────┐
+             │ OBS Browser Source → /overlay       │      │ Browser streamer → /admin        │
+             │ (1080×1920, animasi mesin capit)    │      │ status, kontrol, simulator gift  │
+             └──────────────────┬──────────────────┘      └──────────────────────────────────┘
+                                │ (2) video hasil komposisi OBS
+                                ▼
+                       Siaran TikTok LIVE (penonton melihat capit bergerak)
 ```
 
-### 3.2 Komponen & Tanggung Jawab
+### 2.1 Tanggung Jawab Modul
 
-| Komponen | Teknologi | Tanggung jawab |
+| # | Modul | Tanggung jawab |
 |---|---|---|
-| **Bridge** | Node.js 20 LTS, `tiktok-live-connector` (versi di-pin), `ws`, `better-sqlite3` | Terhubung ke room TikTok Live berdasarkan `@username`, menerima event gift/like/follow/chat, menormalisasi ke skema internal, dedupe combo, mengirim ke Room DO. Menyimpan buffer event saat cloud tidak terjangkau lalu replay. |
-| **Worker (API gateway)** | Cloudflare Workers (TypeScript) | Routing `/ws/bridge`, `/ws/game`, `/ws/admin`, `/api/*`; verifikasi token; meneruskan ke Durable Object yang tepat. |
-| **Room Durable Object** | Cloudflare Durable Objects (SQLite backend) | **Single source of truth** per streamer: antrean play, penentuan hasil (RNG + pity), state machine sesi, broadcast ke semua client. Single-threaded → bebas race condition. |
-| **Database** | Cloudflare D1 | Riwayat play, audit log RNG, leaderboard harian/total, konfigurasi game. |
-| **Game Client** | Phaser 3 + Matter.js (fisika), Vite, TypeScript | Memvisualisasikan play sesuai instruksi server (hasil sudah ditentukan), animasi capit, efek suara, antrean & leaderboard overlay. |
-| **Admin Dashboard** | Vite + Preact/React (ringan), Cloudflare Pages | Status koneksi, konfigurasi win-rate/pity, simulator gift, pause/resume, audit. |
-| **Shared package** | TypeScript | Tipe event, skema validasi (zod), logika payout & antrean (diuji unit test, dipakai Worker & client). |
+| 1 | **Gift Listener** | Terhubung ke room TikTok Live berdasarkan `@username`, menerima event gift, menormalisasi data, menghapus duplikat, menghitung combo dengan benar. |
+| 2 | **Event Bus** | Saluran internal antar-modul (`gift.received` → `coin.credited` → `play.queued` → …). Membuat modul saling lepas: sumber gift bisa diganti tanpa mengubah game. |
+| 3 | **Queue Manager** | Mengubah koin menjadi percobaan, menyusun antrean FIFO, membatasi 20 percobaan aktif per user (sisanya jadi saldo), mengaktifkan mode turbo saat antrean panjang. |
+| 4 | **Game Engine – Claw Controller** | Mengambil percobaan berikutnya, **memutuskan hasil sebelum animasi** (RNG + pity), membuat "skrip gerakan", mengirimnya ke overlay, menunggu konfirmasi selesai, mencatat hasil. Server = sumber kebenaran tunggal. |
+| 5 | **Storage (SQLite)** | Menyimpan antrean & saldo (tahan restart), counter pity, riwayat & audit hasil, konfigurasi, daftar `msgId` yang sudah diproses. File tunggal `data/pasarmalam.db`. |
+| 6 | **HTTP + WS Server** | Menyajikan file statis overlay & admin, serta WebSocket untuk broadcast event realtime ke overlay dan menerima perintah dari admin. |
+| — | **Overlay (Phaser 3)** | Hanya visualisasi: memainkan animasi capit sesuai skrip dari server, sensor lubang, efek suara, panel antrean & leaderboard. |
 
-### 3.3 Alasan Pemilihan
-
-- **Bridge di PC streamer**: koneksi ke TikTok Live adalah koneksi persisten (long-lived WebSocket) dari library unofficial. Menjalankannya di PC streamer = gratis, latency rendah, dan menggunakan **IP residensial** yang jauh lebih jarang diblokir TikTok dibanding IP datacenter. Streamer memang sudah menyalakan PC untuk OBS.
-- **Durable Objects sebagai hub otoritatif**: hasil ditentukan di server, bukan di browser/bridge, sehingga tidak bisa dimanipulasi dan bisa diaudit. DO menyediakan WebSocket + storage dalam satu unit dengan konsistensi kuat, dan **Hibernation API** membuat koneksi idle tidak menghabiskan kuota durasi.
-- **Cloudflare Pages** untuk game & admin: hosting statis gratis tanpa batas bandwidth, CDN global, deploy otomatis dari GitHub.
-- **Phaser 3**: engine 2D matang, gratis, performa baik di OBS Browser Source (Chromium).
-
-### 3.4 Mode Operasi
-
-| Mode | Keterangan |
-|---|---|
-| **Cloud (default)** | Bridge → Worker/DO → Game. Mendukung admin jarak jauh, leaderboard persisten, multi-overlay. |
-| **Local fallback** | Jika Cloudflare tidak terjangkau > 30 dtk, Bridge menjalankan hub WS lokal (`ws://localhost:7777`) dengan logika `packages/shared` yang sama; game client otomatis pindah ke endpoint lokal. Hasil disinkronkan ke D1 saat online kembali. |
-| **Simulasi** | Tanpa TikTok: event gift berasal dari simulator admin/CLI. Untuk development & QA. |
+### 2.2 Prinsip Desain
+- **Satu proses, satu perintah** (`pnpm start`) — mudah dijalankan streamer non-teknis.
+- **Server otoritatif** — hasil diputuskan di server, overlay tidak bisa memengaruhi hasil; beberapa overlay (OBS + preview) selalu menampilkan hasil yang sama.
+- **Event-driven** — setiap langkah adalah event yang tercatat, sehingga bisa diaudit dan di-debug.
+- **Tahan gangguan** — reconnect otomatis, antrean tersimpan di SQLite, tidak ada gift yang hilang atau terhitung ganda.
 
 ---
 
-## 4. Infrastruktur Gratis
+## 3. Cara Kerja: Menangkap Gift Secara Otomatis
 
-| Layanan | Kegunaan | Batas free tier (perkiraan) | Mitigasi |
-|---|---|---|---|
-| Cloudflare Workers Free | API gateway | 100.000 request/hari, 10 ms CPU/request | Event via WebSocket (1 koneksi, bukan request per event). |
-| Cloudflare Durable Objects (SQLite) | Room hub & state | Tersedia di plan Free; kuota request & durasi harian | WebSocket Hibernation, batch broadcast tiap 50 ms. |
-| Cloudflare D1 | Riwayat, audit, leaderboard | 5 GB storage, 5 juta baris dibaca/hari, 100 ribu tulis/hari | Batch insert per 1 dtk; retensi audit 90 hari; agregasi leaderboard. |
-| Cloudflare Pages | Hosting game & admin | Unlimited bandwidth, 500 build/bulan | Build hanya dari branch `main`. |
-| Cloudflare Access (Zero Trust Free) | Proteksi admin | ≤ 50 user | Login email OTP. |
-| GitHub + GitHub Actions | Repo, CI test, deploy `wrangler` | Unlimited untuk repo publik; 2.000 menit/bulan untuk privat | Cache pnpm, jalankan test hanya pada path yang berubah. |
-| Euler Stream (sign server untuk tiktok-live-connector) | Signature koneksi webcast | Free tier dengan rate limit | Koneksi sekali per sesi live; backoff saat limit; opsi API key gratis. |
-| Workers Logs / Sentry Free | Logging & error tracking | Sentry 5k error/bulan | Sampling error di client. |
-| UptimeRobot Free | Monitor endpoint `/health` | 50 monitor, interval 5 menit | — |
+### 3.1 Bagaimana koneksi ke TikTok Live terjadi
 
-> Catatan: angka kuota dapat berubah oleh penyedia; verifikasi ulang saat setup (milestone M0).
+TikTok tidak menyediakan API publik resmi untuk event gift. Aplikasi memakai library open source **`tiktok-live-connector`** (Node.js), yang meniru cara aplikasi web TikTok menerima event live:
 
-Estimasi beban: live 4 jam dengan 2.000 gift → ~2.000 pesan WS masuk, ~10.000 broadcast, ~2.000 baris D1 — jauh di bawah semua kuota.
-
----
-
-## 5. Kontrak Event (Protocol)
-
-Semua pesan berupa JSON dengan amplop standar:
-
-```json
-{ "v": 1, "type": "<event.type>", "id": "<uuid/msgId>", "ts": 1760000000000, "data": { } }
+```
+ Gift Listener                 TikTok                          Sign server (Euler Stream)
+      │  1. GET halaman live @username ─►│                                   │
+      │◄─ roomId + status live ──────────│                                   │
+      │  2. minta signed WebSocket URL ──────────────────────────────────────►│
+      │◄─ URL bertanda tangan ───────────────────────────────────────────────│
+      │  3. buka WebSocket webcast ─────►│                                   │
+      │◄═ stream pesan protobuf ═════════│  (gift, chat, like, follow, ...)  │
+      │  4. decode protobuf → event JS `gift`                                │
 ```
 
-### 5.1 Bridge → Room
+- **Syarat**: akun `@username` harus **sedang LIVE**. Jika belum live, koneksi ditolak (`user offline`).
+- **Tidak perlu login** akun TikTok; cukup username publik.
+- Sign server Euler Stream gratis (dengan rate limit); API key gratis opsional untuk kuota lebih longgar.
 
-**`gift.received`**
-```json
-{
-  "type": "gift.received",
-  "id": "tt-7412345678901234567",
-  "data": {
-    "userId": "6812345",
-    "uniqueId": "budi_santoso",
-    "nickname": "Budi",
-    "avatarUrl": "https://...",
-    "giftId": 5655,
-    "giftName": "Rose",
-    "diamondCount": 1,
-    "repeatCount": 3,
-    "coins": 3
-  }
+### 3.2 Siklus hidup koneksi (otomatis)
+
+```
+ STARTING ─► WAITING_FOR_LIVE ──(live terdeteksi)──► CONNECTING ─► CONNECTED
+                 ▲   (cek tiap 30 dtk)                                │
+                 │                                                    │ putus / error
+                 └──── stream berakhir ◄── RECONNECTING (backoff 1s→2s→4s… maks 30s)
+```
+- Saat aplikasi dinyalakan sebelum live, listener **menunggu** dan mengecek status tiap 30 detik, lalu otomatis terhubung begitu streamer mulai live.
+- Setiap perubahan status dikirim sebagai event `listener.status` ke dashboard admin (indikator hijau/kuning/merah).
+
+### 3.3 Normalisasi & penghitungan koin
+
+Payload gift mentah dari library dinormalisasi ke bentuk internal:
+
+```ts
+type GiftEvent = {
+  msgId: string;        // ID unik pesan TikTok → kunci idempotensi
+  userId: string;
+  uniqueId: string;     // @handle
+  nickname: string;
+  avatarUrl: string;
+  giftId: number;
+  giftName: string;     // "Rose"
+  diamondCount: number; // nilai koin per 1 gift
+  repeatCount: number;  // jumlah combo saat ini
+  repeatEnd: boolean;   // combo selesai?
+  streakable: boolean;  // giftType === 1
+};
+```
+> Nama field mentah berbeda antar versi library; pemetaan dilakukan di satu file adapter (`sources/tiktok.ts`) dan versi library di-**pin**.
+
+**Masalah combo**: gift streakable (mis. Rose ×10) memancarkan *banyak* event selama combo berjalan dengan `repeatCount` yang terus naik (1, 2, 3 … 10). Jika setiap event dihitung penuh, koin akan terhitung berlipat.
+
+**Solusi — hitung delta secara langsung** (respons cepat, tidak menunggu combo selesai):
+
+```ts
+// key = userId + giftId + groupId combo
+const last = streak.get(key) ?? 0;
+const delta = ev.repeatCount - last;          // hanya tambahan baru
+if (delta > 0) credit(ev.userId, delta * ev.diamondCount);
+streak.set(key, ev.repeatCount);
+if (ev.repeatEnd || !ev.streakable) streak.delete(key);
+```
+- Gift non-streakable (gift mahal) dihitung sekali: `diamondCount × repeatCount`.
+- **Idempotensi**: `msgId` yang sudah diproses disimpan di SQLite (24 jam) → event ganda saat reconnect diabaikan.
+- **Konversi**: `koin → percobaan` dengan rasio 1:1, lalu event `coin.credited { userId, coins }` dipancarkan ke Event Bus.
+
+### 3.4 Sumber gift yang dapat diganti (`GiftSource`)
+
+```ts
+interface GiftSource {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+  on(event: "gift", cb: (g: GiftEvent) => void): void;
+  on(event: "status", cb: (s: ListenerStatus) => void): void;
 }
 ```
-Aturan normalisasi di Bridge:
-- Gift streakable (combo) memancarkan banyak event selama combo berlangsung. Bridge **hanya menghitung delta** `repeatCount` atau menunggu `repeatEnd = true`, sehingga koin tidak terhitung ganda.
-- `coins = diamondCount × repeatCount(delta)`.
-- `id` = `msgId` dari TikTok → **idempotency key**; Room menolak `id` yang sudah diproses (disimpan 24 jam).
-
-Event lain (opsional, untuk efek visual): `like.received`, `follow.received`, `chat.received`, `bridge.status`.
-
-### 5.2 Room → Game/Admin
-
-| Event | Data penting | Kegunaan |
-|---|---|---|
-| `room.state` | status (`running`/`paused`), antrean ringkas, play aktif, leaderboard top 10, config publik | Snapshot saat client connect/reconnect |
-| `play.queued` | `playId`, user, posisi antrean, jumlah percobaan ditambahkan | Notifikasi "Budi +3 percobaan" |
-| `play.started` | `playId`, user, `game: "claw"`, **`script`** (lihat 6.3), `outcome`, `turbo` | Client menjalankan animasi sesuai skrip |
-| `claw.result` | `playId`, `outcome` (`win`/`lose`), `prizeId`, `reason` (`dropped_midway`/`empty`/`chute_sensor`) | Overlay MENANG/KALAH, update leaderboard |
-| `play.ack` (Game → Room) | `playId`, `sensorTriggered` | Konfirmasi animasi selesai & sensor lubang; memicu play berikutnya |
-
-### 5.3 Admin → Room (REST `/api/rooms/:id/*` atau WS admin)
-`config.update`, `game.pause`, `game.resume`, `queue.clear`, `gift.simulate`, `pity.reset`.
+Implementasi: `TikTokConnectorSource` (default), `SimulatorSource` (testing tanpa live), dan cadangan bila library rusak, mis. menerima webhook lokal dari aplikasi pihak ketiga (TikFinity) di `POST /hooks/gift`.
 
 ---
 
-## 6. Spesifikasi Game #1 — Capit 2D
+## 4. Cara Kerja: Menjalankan Mesin Capit
 
-### 6.1 Alur Permainan
+### 4.1 Alur end-to-end (dari gift sampai hasil)
 
-| Tahap | Deskripsi |
+```
+Penonton      TikTok    Gift Listener   Queue Mgr    Claw Controller        Overlay (OBS)
+   │ kirim Rose ×3 │          │             │               │                     │
+   │──────────────►│ webcast  │             │               │                     │
+   │               │─────────►│ normalisasi │               │                     │
+   │               │          │ +3 koin ───►│ +3 percobaan  │                     │
+   │               │          │             │── play.queued ┼────────────────────►│ "Budi +3"
+   │               │          │             │   (giliran)   │                     │
+   │               │          │             │──────────────►│ decideOutcome()     │
+   │               │          │             │               │ (RNG+pity, audit)   │
+   │               │          │             │               │── play.started ────►│ animasi
+   │               │          │             │               │   {outcome, script} │ ~8–10 dtk
+   │               │          │             │               │◄──── play.ack ──────│ sensor lubang
+   │               │          │             │               │── claw.result ─────►│ MENANG/KALAH
+   │               │          │             │◄── next ──────│                     │
+```
+
+### 4.2 Tahapan permainan
+
+| Tahap | Apa yang terjadi |
 |---|---|
-| **Start / Insert Coin** | 1 koin gift = 1 koin game. Saat giliran user tiba, sesi dimulai: tampil nama + avatar, animasi koin masuk. |
-| **Positioning** | Capit bergerak horizontal ke posisi X **random per sesi** (ditentukan server via `script.targetX`) dengan sedikit gerakan "ragu" agar terlihat natural. |
-| **Grab & Retract** | Capit turun ke dasar, menutup cakar, mencengkeram **objek terdekat** dari titik turun, lalu ditarik kembali ke atas. |
-| **Payout Rate Logic** | **Weak Grip (default)**: objek terangkat, lalu cengkeraman sengaja dikendurkan di tengah perjalanan → objek jatuh. **Strong Grip (win state)**: cengkeraman penuh dipertahankan sampai di atas lubang hadiah. |
-| **Return to Chute** | Capit bergerak otomatis kembali ke titik awal di atas lubang hadiah. |
-| **Release & Evaluation** | Cakar membuka. Hadiah jatuh melewati **sensor lubang** → **MENANG**. Hadiah lepas sebelum lubang atau capit kosong → **KALAH**. |
+| **Start / Insert Coin** | Giliran user tiba → nama & avatar tampil, animasi koin masuk. 1 koin = 1 sesi capit. |
+| **Positioning** | Capit bergerak horizontal ke `targetX` yang **acak setiap sesi** (dari server), dengan gerakan "ragu" agar natural. |
+| **Grab & Retract** | Capit turun ke dasar, menutup cakar, mencengkeram **objek terdekat**, lalu ditarik ke atas. |
+| **Payout (Grip Strength)** | **Weak Grip (default)**: objek terangkat lalu cengkeraman sengaja dikendurkan di tengah perjalanan. **Strong Grip (win)**: cengkeraman ditahan penuh sampai di atas lubang hadiah. |
+| **Return to Chute** | Capit kembali otomatis ke titik awal di atas lubang hadiah. |
+| **Release & Evaluation** | Cakar membuka. Hadiah melewati **sensor lubang** → **MENANG**. Hadiah lepas sebelum lubang atau capit kosong → **KALAH**. |
 
-### 6.2 State Machine
+### 4.3 State machine (dijalankan di overlay, dikendalikan skrip server)
 
 ```
-IDLE
- └─(play.started)─► COIN_INSERTED
-     └─► POSITIONING (gerak ke targetX random)
-         └─► DESCEND
-             └─► GRAB (tutup cakar, attach objek terdekat / kosong)
-                 └─► RETRACT
-                     ├─[grip = weak]──► DROP_MIDWAY (lepas di dropAt 30–80% perjalanan)
-                     │                     └─► RETURN_TO_CHUTE (kosong)
-                     └─[grip = strong]─► HOLD
-                                           └─► RETURN_TO_CHUTE (membawa hadiah)
-                                                 └─► RELEASE
-                                                     └─► EVALUATE (sensor lubang)
-                                                         └─► RESULT (overlay 2 dtk)
-                                                             └─► IDLE / play berikutnya
+IDLE → COIN_INSERTED → POSITIONING → DESCEND → GRAB → RETRACT
+          ┌───────────────────────────────────────────┴──────────────┐
+     grip = weak                                               grip = strong
+   DROP_MIDWAY (lepas di dropAt 30–80%)                         HOLD
+          └──────────────► RETURN_TO_CHUTE ◄─────────────────────────┘
+                                 → RELEASE → EVALUATE (sensor) → RESULT → IDLE
 ```
 
-Variasi kalah agar tidak monoton (dipilih server secara acak, bobot configurable):
-- `empty` — cakar meleset/tidak mendapat objek (≈ 25%).
-- `dropped_midway` — objek terangkat lalu jatuh saat retract/perjalanan (≈ 65%).
-- `near_miss` — objek jatuh tepat di bibir lubang dan memantul keluar (≈ 10%) — meningkatkan ketegangan.
+### 4.4 Skrip gerakan dari server
 
-### 6.3 Hasil Ditentukan Server, Client Hanya Memvisualisasikan
-
-Agar adil, konsisten di semua overlay, dan tidak bisa dicurangi, **Room DO memutuskan outcome sebelum animasi** dan mengirim skrip deterministik:
+Server memutuskan hasil lebih dulu, lalu mengirim skrip deterministik. Overlay menjalankan fisika Matter.js dengan `seed` yang sama sehingga animasi konsisten di semua tampilan.
 
 ```json
 {
   "type": "play.started",
   "data": {
-    "playId": "p_01J...",
+    "playId": "p_000123",
     "user": { "nickname": "Budi", "avatarUrl": "..." },
-    "game": "claw",
     "outcome": "lose",
     "script": {
       "seed": 918273645,
@@ -237,182 +230,234 @@ Agar adil, konsisten di semua overlay, dan tidak bisa dicurangi, **Room DO memut
   }
 }
 ```
-- Fisika (Matter.js) dijalankan dengan `seed` sehingga animasi sama di semua client.
-- Untuk `outcome = win`, objek dikunci ke cakar (constraint) sampai RELEASE, lalu diarahkan ke lubang; **sensor lubang** (Matter sensor body) mengirim `play.ack { sensorTriggered: true }` sebagai verifikasi. Jika terjadi mismatch (sangat jarang), **hasil server tetap berlaku** dan mismatch dicatat untuk debugging.
 
-### 6.4 Durasi & Antrean
-- Target durasi per percobaan **8–10 detik** (normal).
-- **Mode turbo** otomatis jika antrean > 30 percobaan: animasi dipercepat 2× (≈ 4–5 detik).
-- Percobaan beruntun dari user yang sama dibundel dalam satu "sesi" (tanpa jeda intro ulang).
-- Watchdog: jika `play.ack` tidak diterima dalam 20 dtk (overlay tertutup/crash), Room menyelesaikan play secara otomatis berdasarkan outcome server dan melanjutkan antrean.
+Variasi kalah (dipilih acak, bobot dapat diatur) agar tidak monoton:
+- `empty` — capit meleset, tidak dapat objek (≈ 25%)
+- `dropped_midway` — objek terangkat lalu jatuh di perjalanan (≈ 65%)
+- `near_miss` — objek jatuh di bibir lubang lalu memantul keluar (≈ 10%)
 
-### 6.5 Aset & Tampilan
-- Resolusi canvas **1080×1920 (portrait)**, latar transparan opsional untuk OBS.
-- Elemen UI: mesin capit bertema pasar malam (lampu, warna neon), panel antrean (5 teratas), ticker "Budi +3 percobaan", leaderboard pemenang, counter "percobaan sejak menang terakhir" (opsional, bisa disembunyikan).
-- Aset gratis/CC0 (Kenney.nl, OpenGameArt) atau dibuat sendiri; audio CC0 (freesound).
+Untuk `outcome = win`, objek dikunci ke cakar (constraint fisika) sampai RELEASE, lalu jatuh melewati **sensor lubang** (Matter sensor body) → overlay mengirim `play.ack { sensorTriggered: true }`. Bila terjadi selisih, **hasil server tetap berlaku** dan selisih dicatat untuk debugging.
+
+### 4.5 Pengaturan tempo
+- Durasi normal **8–10 detik** per percobaan.
+- **Turbo**: antrean > 30 percobaan → animasi 2× lebih cepat (≈ 4–5 detik).
+- Percobaan beruntun milik user yang sama digabung dalam satu sesi (intro tidak diulang).
+- **Watchdog**: jika `play.ack` tidak datang dalam 20 detik (OBS ditutup/overlay crash), server menyelesaikan play memakai hasil yang sudah diputuskan dan lanjut ke antrean berikutnya. Jika tidak ada overlay terhubung, antrean di-**pause** otomatis agar penonton tidak "kehilangan" giliran tanpa terlihat.
 
 ---
 
-## 7. Payout Logic — Hybrid RNG + Pity
-
-### 7.1 Parameter Default
+## 5. Payout Logic — Hybrid RNG + Pity (Peluang 1:100)
 
 | Parameter | Default | Keterangan |
 |---|---|---|
-| `baseWinChance` | **0,6%** (0.006) | Peluang strong grip per percobaan |
-| `pityThreshold` | **150** | Percobaan ke-150 tanpa menang → dijamin menang |
-| Peluang efektif | **≈ 1 : 99** (1,01%) | Memenuhi target 1:100 |
-| `pityScope` | `room` | Counter pity berlaku global per room (bukan per user) |
-
-### 7.2 Perhitungan
-
-Dengan peluang dasar *p* dan jaminan menang pada percobaan ke-*N*, rata-rata percobaan per kemenangan:
-
-```
-E = (1 − (1 − p)^N) / p
-  = (1 − 0,994^150) / 0,006
-  ≈ 99,1 percobaan per kemenangan   →  ≈ 1 : 100
-```
-Peluang sebuah siklus mencapai pity (149 kali kalah berturut) ≈ 40,8%; artinya kemenangan terasa acak (bisa menang di percobaan ke-3), namun tidak pernah lebih dari 150 percobaan tanpa pemenang.
-
-### 7.3 Algoritma (di Room DO)
+| `baseWinChance` | **0,6%** | Peluang strong grip per percobaan |
+| `pityThreshold` | **150** | Percobaan ke-150 tanpa pemenang → dijamin menang |
+| Peluang efektif | **≈ 1 : 99** | `E = (1 − 0,994^150) / 0,006 ≈ 99,1` percobaan per kemenangan |
+| Lingkup pity | per room (global) | Bukan per user |
 
 ```ts
-function decideOutcome(state: PayoutState, cfg: PayoutConfig): Decision {
+function decideOutcome(state: PayoutState, cfg: PayoutConfig) {
   state.sinceLastWin += 1;
-  const roll = cryptoRandomFloat(); // crypto.getRandomValues → [0,1)
+  const roll = cryptoRandomFloat();                 // crypto.randomInt / getRandomValues
   const pity = state.sinceLastWin >= cfg.pityThreshold;
   const win = pity || roll < cfg.baseWinChance;
   if (win) state.sinceLastWin = 0;
   return { win, roll, pity, sinceLastWin: state.sinceLastWin };
 }
 ```
-- RNG: `crypto.getRandomValues` (CSPRNG) di server.
-- State `sinceLastWin` disimpan di SQLite DO (bertahan saat restart/deploy).
-- Setiap keputusan dicatat ke **audit log D1**: `playId, userId, roll, pity, sinceLastWin, outcome, configVersion, ts`.
-- Semua parameter dapat diubah lewat admin (perubahan diberi `configVersion` dan tercatat).
-- Fungsi ini berada di `packages/shared` dan diuji dengan **simulasi 1.000.000 percobaan** di unit test (assert rata-rata 1:95–1:105, maksimum gap = 150).
+- `sinceLastWin` disimpan di SQLite → tidak ter-reset saat aplikasi restart.
+- Setiap keputusan dicatat di tabel `audit` (`playId, userId, roll, pity, sinceLastWin, outcome, configVersion, ts`).
+- Kemenangan terasa acak (bisa terjadi di percobaan ke-3), tetapi tidak pernah lebih dari 150 percobaan tanpa pemenang (≈ 41% siklus berakhir lewat pity).
+- Unit test: simulasi **1.000.000 percobaan** → rata-rata harus 1:95–1:105 dan tidak ada gap > 150.
 
 ---
 
-## 8. Aturan Gift → Percobaan & Antrean
+## 6. Aturan Gift → Percobaan & Antrean
 
 | Aturan | Default |
 |---|---|
-| Konversi | `percobaan = diamondCount × repeatCount` (1 koin = 1 percobaan) |
-| Gift yang dihitung | Semua gift (whitelist/blacklist gift ID dapat dikonfigurasi) |
-| Cap per user di antrean | 20 percobaan aktif; kelebihan disimpan sebagai **saldo kredit** user dan otomatis masuk antrean saat slot tersedia (tidak hangus) |
-| Batas total antrean | 500 percobaan; di atas itu kredit tetap tersimpan sebagai saldo |
-| Urutan | FIFO per sesi user (round-robin antar user bila turbo aktif agar adil) |
-| Masa berlaku saldo | Sampai live berakhir + 24 jam (dapat dikonfigurasi) |
-
-Like/follow/share **tidak** memberi percobaan (hanya efek visual), agar mekanisme tetap berbasis gift.
+| Konversi | `percobaan = diamondCount × jumlah gift (delta combo)` |
+| Gift dihitung | Semua gift (whitelist/blacklist gift ID dapat diatur) |
+| Cap per user | 20 percobaan aktif di antrean; kelebihan menjadi **saldo** dan otomatis masuk saat slot tersedia |
+| Batas antrean | 500 percobaan (sisanya tetap tersimpan sebagai saldo) |
+| Urutan | FIFO; round-robin antar user saat turbo agar adil |
+| Like/follow/share | Hanya efek visual, tidak memberi percobaan |
 
 ---
 
-## 9. Admin Dashboard
+## 7. Kontrak Event WebSocket Lokal (`ws://127.0.0.1:3000/ws`)
 
-Fitur MVP:
-1. **Status**: koneksi Bridge ↔ TikTok, Bridge ↔ Cloud, jumlah overlay terhubung, latency.
-2. **Kontrol**: Pause / Resume, Clear antrean, Skip play aktif, Toggle turbo.
-3. **Konfigurasi**: `baseWinChance`, `pityThreshold`, cap antrean, bobot varian kalah, daftar hadiah virtual.
-4. **Simulator gift**: kirim gift palsu (nama, gift, combo) untuk testing.
-5. **Audit & statistik**: total percobaan, total menang, rasio aktual vs target, riwayat 100 play terakhir, export CSV.
-6. **Leaderboard**: top gifter & top pemenang (harian/total).
+Amplop pesan: `{ "v": 1, "type": "...", "id": "...", "ts": 1760000000000, "data": {} }`
 
-Akses dilindungi **Cloudflare Access** (OTP email) + token admin.
+| Arah | Event | Isi / kegunaan |
+|---|---|---|
+| Server → semua | `room.state` | Snapshot (status, antrean, play aktif, leaderboard) saat client connect/reconnect |
+| Server → semua | `listener.status` | `waiting_for_live` / `connected` / `reconnecting` / `error` |
+| Server → semua | `gift.received` | Ticker "Budi mengirim Rose ×3" |
+| Server → semua | `play.queued` | Penambahan percobaan & posisi antrean |
+| Server → overlay | `play.started` | `outcome` + `script` (lihat 4.4) |
+| Overlay → server | `play.ack` | Animasi selesai + `sensorTriggered` |
+| Server → semua | `claw.result` | `win`/`lose`, `reason`, `prizeId` |
+| Admin → server | `admin.*` | `pause`, `resume`, `skip`, `queue.clear`, `config.update`, `gift.simulate` (wajib token admin) |
+
+Semua pesan masuk divalidasi dengan **zod**; skema berada di `packages/shared` dan dipakai bersama server, overlay, dan admin.
 
 ---
 
-## 10. Kebutuhan Non-Fungsional
+## 8. Tech Stack
+
+| Lapisan | Teknologi | Alasan |
+|---|---|---|
+| Runtime | **Node.js 20 LTS** + **TypeScript** | Ekosistem library TikTok Live paling matang ada di Node; satu bahasa untuk server & client |
+| Penangkap gift | **tiktok-live-connector** (versi di-pin) | Library open source paling aktif untuk event TikTok Live (gift, combo, chat, like) |
+| Sign server | **Euler Stream** (free tier, bawaan library) | Diperlukan library untuk membuat URL WebSocket bertanda tangan |
+| Web server | **Fastify** + **@fastify/websocket** + **@fastify/static** | Ringan, cepat, satu port untuk HTTP & WebSocket |
+| Database | **SQLite** via **better-sqlite3** (mode WAL) | Tanpa instalasi server DB, satu file, sinkron & sangat cepat, tahan restart |
+| Validasi | **zod** | Skema event bersama, mencegah data rusak |
+| Game engine | **Phaser 3** + **Matter.js** (bawaan Phaser) | Engine 2D matang; fisika untuk cakar, objek, sensor lubang; lancar di OBS Browser Source (Chromium) |
+| Admin UI | **Vite** + Preact (atau HTML + Alpine.js) | Ringan, build statis disajikan Fastify |
+| Build & tooling | **pnpm** workspace, **Vite**, **tsx**, **Vitest**, ESLint/Prettier | Monorepo sederhana, test cepat |
+| Logging | **pino** (bawaan Fastify) → file `logs/` | Log terstruktur untuk debugging live |
+| Distribusi (opsional) | `start.bat` / `start.sh`; Node SEA atau `pkg` untuk satu file `.exe` | Sekali klik untuk streamer |
+| Aset | Kenney.nl / OpenGameArt (CC0), audio freesound (CC0) | Gratis untuk komersial |
+
+---
+
+## 9. Infrastruktur Lokal & Kebutuhan PC
+
+| Kebutuhan | Spesifikasi |
+|---|---|
+| OS | Windows 10/11, macOS 12+, atau Linux |
+| CPU / RAM | Setara Intel i5 gen-8 / Ryzen 5, RAM 8 GB (aplikasi ini memakai ±150 MB RAM; sisanya untuk OBS & encoding) |
+| Software | Node.js 20 LTS, pnpm, OBS Studio (atau TikTok LIVE Studio yang mendukung sumber browser/window capture) |
+| Jaringan | Internet stabil (upload ≥ 5 Mbps untuk siaran); koneksi keluar HTTPS/WSS ke TikTok & Euler Stream |
+| Port lokal | `3000` (dapat diubah), **bind ke 127.0.0.1** — tidak terbuka ke jaringan luar, tidak perlu setting firewall/port forwarding |
+| Penyimpanan | ± 200 MB (aplikasi + aset + database) |
+
+| Komponen | Lokal / Internet | Biaya |
+|---|---|---|
+| Logika game, antrean, payout, database, overlay, admin | Lokal | Gratis |
+| Koneksi pembaca event TikTok Live | Internet | Gratis |
+| Sign server Euler Stream | Internet | Gratis (rate limit) |
+| Siaran live (OBS → TikTok) | Internet | Gratis |
+
+---
+
+## 10. Cara Menjalankan (Runbook Streamer)
+
+**Sekali saja (instalasi):**
+```bash
+# 1. Install Node.js 20 LTS (nodejs.org) lalu pnpm
+npm install -g pnpm
+# 2. Ambil proyek & install dependency
+git clone <repo> pasar-malam && cd pasar-malam
+pnpm install
+# 3. Salin konfigurasi
+cp .env.example .env
+```
+
+**Isi `.env`:**
+```env
+TIKTOK_USERNAME=akun_streamer      # tanpa @
+PORT=3000
+ADMIN_TOKEN=ganti-dengan-rahasia
+EULER_API_KEY=                     # opsional
+GIFT_SOURCE=tiktok                 # tiktok | simulator
+```
+
+**Setiap mau live:**
+1. Jalankan `pnpm start` (atau klik dua kali `start.bat`).
+2. Buka `http://127.0.0.1:3000/admin` → status listener **"Menunggu live"**.
+3. Di OBS: *Sources → + → Browser* → URL `http://127.0.0.1:3000/overlay`, ukuran **1080×1920**, centang *Shutdown source when not visible* = **off**.
+4. Mulai LIVE di TikTok → listener otomatis berubah **"Terhubung"** dalam ≤ 30 detik.
+5. Gift penonton langsung menggerakkan mesin capit.
+
+**Testing tanpa live:**
+- `GIFT_SOURCE=simulator pnpm start`, lalu kirim gift palsu dari tombol **Simulator** di `/admin`, atau
+- `pnpm simulate --user budi --gift Rose --count 5`.
+
+---
+
+## 11. Struktur Folder & Ekstensibilitas
+
+```
+pasar-malam/
+├── apps/
+│   ├── server/                 # Pasar Malam Server (Node.js)
+│   │   ├── src/sources/        # GiftSource: tiktok.ts, simulator.ts, webhook.ts
+│   │   ├── src/core/           # event-bus, queue-manager, storage (SQLite)
+│   │   ├── src/games/claw/     # ClawController (server side)
+│   │   └── src/http/           # Fastify routes + WebSocket hub
+│   ├── overlay/                # Phaser 3: shell Pasar Malam + scene per game
+│   │   └── src/games/claw/     # ClawScene, state machine, aset
+│   └── admin/                  # dashboard
+├── packages/shared/            # tipe & skema event (zod), decideOutcome, aturan antrean + test
+├── data/                       # pasarmalam.db (dibuat otomatis)
+├── .env.example · start.bat · start.sh
+└── PRD.md
+```
+
+Game Pasar Malam berikutnya cukup mengimplementasikan:
+```ts
+interface GameModule {
+  id: string;                                  // "claw", "lempar-gelang", "tembak-balon"
+  costPerPlay: number;                         // default 1 koin
+  decide(ctx: DecideContext): PlayScript;      // server: hasil + skrip
+  createScene(): Phaser.Scene;                 // overlay: visualisasi
+}
+```
+Gift Listener, Event Bus, antrean, payout, audit, dan WebSocket dipakai ulang tanpa perubahan.
+
+---
+
+## 12. Kebutuhan Non-Fungsional
 
 | Kategori | Target |
 |---|---|
-| Latency gift → `play.queued` tampil | < 1 detik (p95) |
-| Latency gift → animasi mulai (antrean kosong) | < 2 detik (p95) |
-| FPS overlay di OBS | ≥ 50 fps pada PC streamer menengah |
-| Ketersediaan selama live | ≥ 99% (dengan local fallback) |
-| Reconnect | Bridge & client: exponential backoff 1s → 2s → 4s … maks 30s; client meminta `room.state` saat reconnect |
-| Idempotensi | Tidak ada gift dihitung ganda (dedupe `msgId` + delta combo) |
-| Durabilitas | Antrean & saldo kredit bertahan saat deploy/restart (SQLite DO) |
-| Keamanan | Token Bridge (HMAC, rotasi via admin), token overlay read-only, CORS terbatas ke domain Pages, admin via CF Access, validasi skema (zod) di semua input |
-| Privasi | Hanya menyimpan `userId`, `uniqueId`, `nickname`, `avatarUrl` publik; retensi 90 hari |
-| Observability | Log terstruktur (Workers Logs), endpoint `/health`, metrik ringkas di admin |
-
----
-
-## 11. Struktur Repository (Monorepo pnpm)
-
-```
-Live-TIktok-Trigger-Gift/
-├── apps/
-│   ├── bridge/          # Node.js: tiktok-live-connector → Room DO; local fallback hub; CLI simulator
-│   ├── worker/          # Cloudflare Worker + Durable Object Room + D1 migrations (wrangler.toml)
-│   ├── game/            # Phaser 3 overlay (Pasar Malam shell + modul game)
-│   │   └── src/games/claw/   # Capit 2D
-│   └── admin/           # Dashboard admin
-├── packages/
-│   └── shared/          # tipe event, skema zod, payout (RNG+pity), aturan antrean, tests
-├── .github/workflows/   # CI (lint, test) & deploy (wrangler, Pages)
-├── PRD.md
-└── README.md
-```
-
-### 11.1 Interface Modul Game (ekstensibilitas Pasar Malam)
-
-```ts
-interface GameModule {
-  id: string;                         // "claw", "lempar-gelang", "tembak-balon", ...
-  decide(ctx: DecideContext): PlayScript;      // server: tentukan outcome + skrip (dipakai Room DO)
-  createScene(): Phaser.Scene;                 // client: visualisasi
-  costPerPlay: number;                         // default 1 koin
-}
-```
-Game baru cukup mengimplementasikan `GameModule`; pipeline gift, antrean, payout, dan audit dipakai ulang.
-
----
-
-## 12. Roadmap & Milestone
-
-| Milestone | Cakupan | Estimasi |
-|---|---|---|
-| **M0 — Setup** | Monorepo, akun Cloudflare (Workers, DO, D1, Pages, Access), CI/CD GitHub Actions, verifikasi kuota | 1–2 hari |
-| **M1 — Pipeline gift** | Bridge (connect, normalisasi, dedupe combo, buffer offline), Worker + Room DO (idempotensi, antrean, broadcast), simulator gift | 3–4 hari |
-| **M2 — Capit 2D MVP** | Payout RNG+pity + test simulasi, state machine & animasi Phaser, sensor lubang, overlay antrean, mode turbo, watchdog | 5–7 hari |
-| **M3 — Admin & data** | Dashboard, konfigurasi, audit & statistik, leaderboard D1, local fallback mode | 3–4 hari |
-| **M4 — Uji live & polish** | Uji di live sungguhan, tuning animasi & audio, dokumentasi setup streamer (README) | 2–3 hari |
-| **M5 — Game Pasar Malam berikutnya** | Modul game baru via `GameModule` (mis. lempar gelang, tembak balon, roda putar) | iteratif |
+| Latency gift → muncul di antrean overlay | < 1 detik (p95) |
+| Latency gift → capit mulai bergerak (antrean kosong) | < 1,5 detik (p95) |
+| FPS overlay di OBS | ≥ 50 fps |
+| Reconnect | Listener & overlay otomatis (backoff maks 30 dtk); overlay meminta `room.state` saat tersambung kembali |
+| Akurasi | 0 gift hilang / ganda (delta combo + idempotensi `msgId`) |
+| Durabilitas | Antrean, saldo, counter pity bertahan saat aplikasi/PC restart |
+| Keamanan | Server hanya bind `127.0.0.1`; perintah admin wajib `ADMIN_TOKEN`; validasi zod di semua input |
+| Privasi | Hanya data publik (`userId`, `@handle`, nickname, avatar); retensi 90 hari |
 
 ---
 
 ## 13. Risiko & Mitigasi
 
-| Risiko | Dampak | Mitigasi |
-|---|---|---|
-| Library unofficial (`tiktok-live-connector`) rusak saat TikTok mengubah protokol | Gift tidak terbaca | Pin versi, abstraksi `GiftSource` (mudah ganti ke sumber lain, mis. TikFinity/TikTok LIVE Studio webhook), mode simulasi, monitor rilis library |
-| Rate limit sign server (Euler Stream) | Gagal connect | Satu koneksi per sesi, backoff, API key free tier |
-| Pemblokiran IP oleh TikTok | Gagal connect | Bridge berjalan di IP residensial streamer |
-| Kebijakan TikTok terkait konten menyerupai judi | Akun kena sanksi | Hadiah hanya virtual, tanpa cash-out, tanpa istilah taruhan; tampilkan disclaimer "hiburan, hadiah virtual" |
-| Kuota free tier terlampaui | Layanan terhenti | Hibernation, batching, monitoring kuota di admin, local fallback |
-| Overlay crash/ditutup saat play | Antrean macet | Watchdog 20 dtk, outcome server tetap berlaku |
-| Gift ganda/terlewat saat reconnect | Ketidakadilan | Idempotensi `msgId`, buffer offline Bridge + replay |
+| Risiko | Mitigasi |
+|---|---|
+| `tiktok-live-connector` rusak saat TikTok mengubah protokol | Pin versi, adapter tunggal `sources/tiktok.ts`, `GiftSource` cadangan (webhook TikFinity), mode simulator |
+| Rate limit / gangguan sign server Euler Stream | Satu koneksi per sesi live, backoff, API key gratis |
+| PC/OBS mati = game berhenti | Antrean & saldo tersimpan di SQLite, dilanjutkan saat aplikasi hidup kembali; auto-pause bila overlay tidak terhubung |
+| Internet putus sesaat | Reconnect otomatis + dedupe `msgId` |
+| Kebijakan TikTok terkait konten menyerupai judi | Hadiah virtual saja, tanpa cash-out, disclaimer "hiburan" di overlay |
+| Beban CPU mengganggu encoding OBS | Overlay ringan (sprite atlas, 1 scene aktif), batas FPS 60, turbo saat antrean panjang |
 
 ---
 
-## 14. Metrik Sukses
+## 14. Roadmap
 
-- Rasio percobaan:menang aktual dalam rentang **1:95 – 1:105** (rolling 10.000 percobaan).
-- 0 kasus gift dihitung ganda / hilang pada uji 1.000 gift simulasi + 1 sesi live.
-- p95 latency gift → animasi < 2 detik.
-- Biaya infrastruktur bulanan **Rp 0**.
-- Peningkatan gift per jam dibanding live tanpa game (diukur oleh streamer).
+| Milestone | Cakupan | Estimasi |
+|---|---|---|
+| **M0 — Setup** | Monorepo pnpm, Fastify + SQLite + WebSocket hub, `.env`, start script | 1 hari |
+| **M1 — Gift Listener** | `TikTokConnectorSource` (auto-wait live, reconnect), normalisasi, delta combo, idempotensi, `SimulatorSource`, uji di live sungguhan | 2–3 hari |
+| **M2 — Mesin Capit MVP** | Queue Manager, `decideOutcome` + test 1 juta simulasi, ClawController, overlay Phaser (state machine, fisika, sensor lubang), turbo, watchdog | 5–7 hari |
+| **M3 — Admin** | Status listener, pause/resume/skip, konfigurasi payout, simulator, audit & statistik | 2–3 hari |
+| **M4 — Uji live & polish** | Uji live 2–3 sesi, tuning animasi & audio, `start.bat`, panduan streamer | 2 hari |
+| **M5 — Opsional** | Game Pasar Malam berikutnya via `GameModule`; sinkronisasi leaderboard online (mis. Cloudflare/Supabase free tier) | iteratif |
 
-## 15. Acceptance Criteria — Capit 2D MVP
+---
 
-1. Gift 1 koin menambah tepat 1 percobaan; gift 5 koin combo ×3 menambah 15 (dengan cap & saldo kredit).
-2. Setiap percobaan menjalankan urutan: insert coin → positioning random → turun → grab → retract → (drop / hold) → return to chute → release → evaluasi.
-3. Weak grip menjatuhkan objek sebelum lubang; strong grip membawa objek hingga melewati sensor lubang.
-4. Hasil MENANG hanya terjadi bila server memutuskan `win`; seluruh overlay yang terhubung menampilkan hasil yang identik.
-5. Unit test simulasi 1.000.000 percobaan: rata-rata 1:95–1:105 dan tidak ada gap > 150.
-6. Admin dapat pause/resume, mengubah win-rate, dan mengirim gift simulasi; perubahan tercatat di audit.
-7. Bridge/overlay yang terputus tersambung kembali otomatis tanpa kehilangan antrean.
+## 15. Acceptance Criteria (MVP)
+
+1. Menjalankan `pnpm start` sebelum live → status "Menunggu live"; setelah live dimulai, listener terhubung otomatis ≤ 30 detik tanpa tindakan manual.
+2. Gift Rose (1 koin) menambah tepat **1** percobaan; Rose combo ×10 menambah tepat **10** (bukan 55); gift 5 koin ×3 menambah **15** (dengan cap 20 & saldo).
+3. Setiap percobaan menjalankan urutan lengkap: insert coin → positioning acak → turun → grab → retract → (drop / hold) → return to chute → release → evaluasi sensor.
+4. Weak grip menjatuhkan objek sebelum lubang; strong grip membawa objek melewati sensor lubang → overlay menampilkan MENANG.
+5. Hasil MENANG hanya terjadi bila server memutuskan `win`; semua overlay yang terhubung menampilkan hasil identik.
+6. Test simulasi 1.000.000 percobaan: rata-rata 1:95–1:105, tidak ada gap > 150.
+7. Internet diputus 10 detik saat live → listener tersambung kembali otomatis, tidak ada gift ganda.
+8. Aplikasi ditutup lalu dibuka kembali → antrean, saldo, dan counter pity tetap utuh.
